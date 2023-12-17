@@ -1,7 +1,8 @@
 # Library for risk management
 import numpy as np
 import pandas as pd
-from scipy.stats import t
+from scipy.stats import t, norm
+from scipy.optimize import minimize
 from statsmodels.tsa.arima.model import ARIMA
 
 ## 1. Covariance estimation techniques
@@ -236,3 +237,295 @@ def return_calculate(prices, method="DISCRETE", dateColumn="Date"):
         out[vars[i]] = p2[:, i]
 
     return out
+
+### A function that compute the pairwise covariance matrix with input data that includes some NA values
+def pairwise_cov(x, skipMiss=True, func=np.cov):
+    n, m = x.shape
+    nMiss = np.sum(np.isnan(x), axis=0)
+
+    # nothing missing, just calculate it.
+    if np.sum(nMiss) == 0:
+        return func(x)
+
+    idxMissing = [set(np.where(np.isnan(x[:, i]))[0]) for i in range(m)]
+
+    if skipMiss:
+        # Skipping Missing, get all the rows which have values and calculate the covariance
+        rows = set(range(n))
+        for c in range(m):
+            for rm in idxMissing[c]:
+                if rm in rows:
+                    rows.remove(rm)
+        rows = sorted(list(rows))
+        return func(x[rows,:].T)
+
+    else:
+        # Pairwise, for each cell, calculate the covariance.
+        out = np.empty((m, m))
+        for i in range(m):
+            for j in range(i+1):
+                rows = set(range(n))
+                for c in (i,j):
+                    for rm in idxMissing[c]:
+                        if rm in rows:
+                            rows.remove(rm)
+                rows = sorted(list(rows))
+                out[i,j] = func(x[rows,:][:,[i,j]].T)[0,1]
+                if i != j:
+                    out[j,i] = out[i,j]
+        return out
+
+### function to compute the Super Efficient, Maximum Sharpe Ratio, portfolio.
+def max_sharpe_ratio_portfolio(ER, cov, rf):
+    func = lambda wts: -(wts@ER-rf)/np.sqrt(wts@cov@wts)
+    x0 = np.full(ER.shape[0], 1/ER.shape[0])
+    cons = [{'type':'ineq', 'fun':lambda x:x}, 
+            {'type':'eq', 'fun':lambda x:sum(x)-1}]
+    bounds = [(0, 1) for _ in range(ER.shape[0])]
+    res = minimize(func, x0, method='SLSQP', bounds=bounds, constraints=cons)
+    return res
+
+### function to compute the risk budgets (rist portion of the portfolio)
+def risk_budget(wts, cov):
+    portfolioStd = np.sqrt(wts@cov@wts)
+    csd = wts*(cov@wts)/portfolioStd
+    return csd/portfolioStd
+
+### function to compute the risk parity portfolio
+def risk_parity_portfolio(cov):
+    func = lambda wts: (wts*(cov@wts)/np.sqrt(wts@cov@wts)).std()
+    x0 = np.full(cov.shape[0], 1/cov.shape[0])
+    cons = [{'type':'ineq', 'fun':lambda x:x},
+            {'type':'eq', 'fun':lambda x:sum(x)-1}]
+    bounds = [(0, 1) for _ in range(cov.shape[0])]
+    res = minimize(func, x0, method='SLSQP',bounds=bounds,constraints=cons)
+    return res
+
+#############################################
+### function to compute risk attributions
+def risk_contrib(w, covar):
+    risk_contrib = w * covar.dot(w) / np.sqrt(w.dot(covar).dot(w))
+    return risk_contrib
+
+def expost_attribution(w, upReturns):
+    _stocks = list(upReturns.columns)
+    n = upReturns.shape[0]
+    pReturn = np.empty(n)
+    weights = np.empty((n, len(w)))
+    lastW = np.copy(w)
+    matReturns = upReturns[_stocks].values
+
+    for i in range(n):
+        # Save Current Weights in Matrix
+        weights[i,:] = lastW
+
+        # Update Weights by return
+        lastW = lastW * (1.0 + matReturns[i,:])
+
+        # Portfolio return is the sum of the updated weights
+        pR = np.sum(lastW)
+        # Normalize the wieghts back so sum = 1
+        lastW = lastW / pR
+        # Store the return
+        pReturn[i] = pR - 1
+
+    # Set the portfolio return in the Update Return DataFrame
+    upReturns['Portfolio'] = pReturn
+
+    # Calculate the total return
+    totalRet = np.exp(np.sum(np.log(pReturn + 1))) - 1
+    # Calculate the Carino K
+    k = np.log(totalRet + 1) / totalRet
+
+    # Carino k_t is the ratio scaled by 1/K 
+    carinoK = np.log(1.0 + pReturn) / pReturn / k
+    # Calculate the return attribution
+    attrib = pd.DataFrame(matReturns * (weights * carinoK[:, np.newaxis]), columns=_stocks)
+
+    # Set up a Dataframe for output.
+    Attribution = pd.DataFrame({'Value': ["TotalReturn", "Return Attribution"]})
+
+    _ss = list(upReturns.columns)
+    _ss.append('Portfolio')
+    
+    for s in _ss:
+        # Total Stock return over the period
+        tr = np.exp(np.sum(np.log(upReturns[s] + 1))) - 1
+        # Attribution Return (total portfolio return if we are updating the portfolio column)
+        atr =  attrib[s].sum() if s != 'Portfolio' else tr
+        # Set the values
+        Attribution[s] = [tr, atr]
+
+        # Y is our stock returns scaled by their weight at each time
+        Y =  matReturns * weights
+        # Set up X with the Portfolio Return
+        X = np.column_stack((np.ones((pReturn.shape[0], 1)), pReturn))
+        # Calculate the Beta and discard the intercept
+        B = (np.linalg.inv(X.T @ X) @ X.T @ Y)[1,:]
+        # Component SD is Beta times the standard Deviation of the portfolio
+        cSD = B * np.std(pReturn)
+
+        Expost_Attribution = pd.concat([Attribution,    
+            pd.DataFrame({"Value": ["Vol Attribution"], 
+                        **{_stocks[i]: [cSD[i]] for i in range(len(_stocks))},
+                        "Portfolio": [np.std(pReturn)]})
+        ], ignore_index=True)
+
+    return Expost_Attribution
+
+def expost_factor(w, upReturns, upFfData, Betas):
+    stocks = upReturns.columns
+    factors = list(upFfData.columns)
+    
+    n = upReturns.shape[0]
+    m = len(stocks)
+    
+    pReturn = np.empty(n)
+    residReturn = np.empty(n)
+    weights = np.empty((n, len(w)))
+    factorWeights = np.empty((n, len(factors)))
+    lastW = w.copy()
+    matReturns = upReturns[stocks].to_numpy()
+    ffReturns = upFfData[factors].to_numpy()
+
+    for i in range(n):
+        # Save Current Weights in Matrix
+        weights[i,:] = lastW
+
+        #Factor Weight
+        factorWeights[i,:] = Betas.T @ lastW
+
+        # Update Weights by return
+        lastW = lastW * (1.0 + matReturns[i,:])
+
+        # Portfolio return is the sum of the updated weights
+        pR = np.sum(lastW)
+        # Normalize the weights back so sum = 1
+        lastW = lastW / pR
+        # Store the return
+        pReturn[i] = pR - 1
+
+        # Residual
+        residReturn[i] = (pR-1) - factorWeights[i,:] @ ffReturns[i,:]
+
+    # Set the portfolio return in the Update Return DataFrame
+    upFfData["Alpha"] = residReturn
+    upFfData["Portfolio"] = pReturn
+
+    # Calculate the total return
+    totalRet = np.exp(np.sum(np.log(pReturn + 1))) - 1
+    # Calculate the Carino K
+    k = np.log(totalRet + 1) / totalRet
+
+    # Carino k_t is the ratio scaled by 1/K 
+    carinoK = np.log(1.0 + pReturn) / pReturn / k
+    # Calculate the return attribution
+    attrib = pd.DataFrame(ffReturns * (factorWeights * carinoK[:, np.newaxis]), columns=factors)
+    attrib["Alpha"] = residReturn * carinoK
+
+    # Set up a DataFrame for output.
+    Attribution = pd.DataFrame({"Value": ["TotalReturn", "Return Attribution"]})
+
+    
+    newFactors = factors[:]
+    newFactors.append('Alpha')
+
+    ss = factors[:]
+    ss.append('Alpha')
+    ss.append('Portfolio')
+
+    # Loop over the factors
+    for s in ss:
+        # Total Stock return over the period
+        tr = np.exp(np.sum(np.log(upFfData[s] + 1))) - 1
+        # Attribution Return (total portfolio return if we are updating the portfolio column)
+        atr = sum(attrib[s]) if s != "Portfolio" else tr
+        # Set the values
+        Attribution[s] = [tr, atr]
+
+    # Realized Volatility Attribution
+
+    # Y is our stock returns scaled by their weight at each time
+    Y = np.hstack((ffReturns * factorWeights, residReturn[:,np.newaxis]))
+    # Set up X with the Portfolio Return
+    X = np.hstack((np.ones((n,1)), pReturn[:,np.newaxis]))
+    # Calculate the Beta and discard the intercept
+    B = np.linalg.inv(X.T @ X) @ X.T @ Y
+    B = B[1,:]
+    # Component SD is Beta times the standard Deviation of the portfolio
+    cSD = B * np.std(pReturn)
+
+    # Check that the sum of component SD is equal to the portfolio SD
+    assert np.isclose(np.sum(cSD), np.std(pReturn))
+
+    # Add the Vol attribution to the output
+    Expost_Attribution = pd.concat([Attribution, 
+        pd.DataFrame({"Value": "Vol Attribution", **{newFactors[i]:cSD[i] for i in range(len(newFactors))}, "Portfolio":np.std(pReturn)}, index=[0])
+    ])
+
+    return Expost_Attribution
+#############################################
+
+### GBSM
+class GBSM:
+    def __init__(self, S, X, T, sigma, r, b, option_type):
+        self.S = S
+        self.X = X
+        self.T = T
+        self.r = r
+        self.b = b
+        self.sigma = sigma
+        self.option_type = option_type
+        self.d1 = (np.log(S/X)+(b+sigma**2/2)*T)/(sigma*np.sqrt(T))
+        self.d2 = self.d1-sigma*np.sqrt(T)
+
+    # Function for computing Black-Scholes prices (values)
+    def black_scholes(self):
+        if self.option_type == 'Call':
+            return self.S*np.exp((self.b-self.r)*self.T)*norm.cdf(self.d1)-self.X*np.exp(-self.r*self.T)*norm.cdf(self.d2)
+        elif self.option_type == 'Put':
+            return self.X*np.exp(-self.r*self.T)*norm.cdf(-self.d2)-self.S*np.exp((self.b-self.r)*self.T)*norm.cdf(-self.d1)
+        else:
+            raise ValueError("Option type must be either 'Call' or 'Put'")
+    
+    def _delta(self):
+        if self.option_type == 'Call':
+            return np.exp((self.b-self.r)*self.T)*norm.cdf(self.d1)
+        elif self.option_type == 'Put':
+            return np.exp((self.b-self.r)*self.T)*(norm.cdf(self.d1)-1)
+        else:
+            raise ValueError("Option type must be either 'Call' or 'Put'")
+    
+    def _gamma(self):
+        return norm.pdf(self.d1)*np.exp((self.b-self.r)*self.T)/(self.S*self.sigma*np.sqrt(self.T))
+
+    def _vega(self):
+        return self.S*np.exp((self.b-self.r)*self.T)*norm.pdf(self.d1)*np.sqrt(self.T)
+
+    def _theta(self):
+        if self.option_type == 'Call':
+            return -self.S*np.exp((self.b-self.r)*self.T)*norm.pdf(self.d1)*self.sigma/(2*np.sqrt(self.T))-(self.b-self.r)*self.S*np.exp((self.b-self.r)*self.T)*norm.cdf(self.d1)-self.r*self.X*np.exp(-self.r*self.T)*norm.cdf(self.d2)
+        elif self.option_type == 'Put':
+            return -self.S*np.exp((self.b-self.r)*self.T)*norm.pdf(self.d1)*self.sigma/(2*np.sqrt(self.T))+(self.b-self.r)*self.S*np.exp((self.b-self.r)*self.T)*norm.cdf(-self.d1)+self.r*self.X*np.exp(-self.r*self.T)*norm.cdf(-self.d2)
+        else:
+            raise ValueError("Option type must be either 'Call' or 'Put'")
+
+    def _rho(self): # Note: original formual assumes r=b, yet it does not hold in this case, so we redo the derivation
+        if self.option_type == 'Call': # Call: rho = -T*S*exp((b-r)*T)*N(d1)+T*X*exp(-r*T)*N(d2)
+            return -self.T*self.S*np.exp((self.b-self.r)*self.T)*norm.cdf(self.d1)+self.T*self.X*np.exp(-self.r*self.T)*norm.cdf(self.d2)
+        elif self.option_type == 'Put': # Put: rho = T*S*exp((b-r)*T)*N(-d1)-T*X*exp(-r*T)*N(-d2)
+            return self.T*self.S*np.exp((self.b-self.r)*self.T)*norm.cdf(-self.d1)-self.T*self.X*np.exp(-self.r*self.T)*norm.cdf(-self.d2)
+        else:
+            raise ValueError("Option type must be either 'Call' or 'Put'")
+        
+    def _carry_rho(self):
+        if self.option_type == 'Call':
+            return self.T*self.S*np.exp((self.b-self.r)*self.T)*norm.cdf(self.d1)
+        elif self.option_type == 'Put':
+            return -self.T*self.S*np.exp((self.b-self.r)*self.T)*norm.cdf(-self.d1)
+        else:
+            raise ValueError("Option type must be either 'Call' or 'Put'")
+
+    def getAllGreeks(self):
+        return {'delta': self._delta(), 'gamma': self._gamma(), 'vega': self._vega(), 'theta': self._theta(), 'rho': self._rho(), 'carry_rho': self._carry_rho()}
+
